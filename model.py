@@ -13,7 +13,7 @@ def build_network(num_actions, agent_history_length, resized_width, resized_heig
         #model = Conv2D(filter=64, kernel_size=(3,3), strides=(1,1), activation='relu', padding='same')(model)
         model = Flatten()(model)
         model = Dense(256, activation='relu')(model)
-        print model
+        print(model)
         q_values = Dense(num_actions)(model)
         
         #UserWarning: Update your `Model` call to the Keras 2 API: 
