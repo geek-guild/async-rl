@@ -5,6 +5,7 @@ os.environ["KERAS_BACKEND"] = "tensorflow"
 from skimage.transform import resize
 from skimage.color import rgb2gray
 from atari_environment import AtariEnvironment
+from custom_environment import CustomEnvironment
 import threading
 import tensorflow as tf
 import sys
@@ -16,14 +17,28 @@ from keras import backend as K
 from model import build_network
 from keras import backend as K
 
+import customenv
+
+from baselines.common.vec_env import VecFrameStack, VecNormalize, VecEnv
+from baselines.common.vec_env.vec_video_recorder import VecVideoRecorder
+from baselines.common.cmd_util import common_arg_parser, parse_unknown_args, make_vec_env, make_env
+from baselines.common.tf_util import get_session
+from collections import defaultdict
+import re
+import multiprocessing
+
 flags = tf.app.flags
 
 flags.DEFINE_string('experiment', 'dqn_breakout', 'Name of the current experiment')
-flags.DEFINE_string('game', 'Breakout-v0', 'Name of the atari game to play. Full list here: https://gym.openai.com/envs#atari')
+flags.DEFINE_string('game', None, 'Name of the atari game to play. Full list here: https://gym.openai.com/envs#atari')
+flags.DEFINE_string('env', None, 'Name of the atari game to play. Full list here: https://gym.openai.com/envs#atari')
+flags.DEFINE_string('env_id', None, 'Name of the env_id')
+flags.DEFINE_string('env_type', None, 'Name of the env_type')
 flags.DEFINE_integer('num_concurrent', 8, 'Number of concurrent actor-learner threads to use during training.')
 flags.DEFINE_integer('tmax', 80000000, 'Number of training timesteps.')
 flags.DEFINE_integer('resized_width', 84, 'Scale screen to this width.')
 flags.DEFINE_integer('resized_height', 84, 'Scale screen to this height.')
+flags.DEFINE_integer('input_size', 4, 'Number of input data size.')
 flags.DEFINE_integer('agent_history_length', 4, 'Use this number of recent screens as the environment state.')
 flags.DEFINE_integer('network_update_frequency', 32, 'Frequency with which each actor learner thread does an async gradient update')
 flags.DEFINE_integer('target_network_update_frequency', 10000, 'Reset the target network every n timesteps')
@@ -43,9 +58,27 @@ flags.DEFINE_boolean('testing', False, 'If true, run gym evaluation')
 flags.DEFINE_string('checkpoint_path', 'path/to/recent.ckpt', 'Path to recent checkpoint to use for evaluation')
 flags.DEFINE_string('eval_dir', '/tmp/', 'Directory to store gym evaluation')
 flags.DEFINE_integer('num_eval_episodes', 100, 'Number of episodes to run gym evaluation.')
+
+flags.DEFINE_string('alg', 'deepq', 'Name of alg')
+flags.DEFINE_integer('num_env', 1, 'Number of env.')
+flags.DEFINE_integer('seed', 1, 'Number of seed.')
+
+flags.DEFINE_integer('layers', 26, 'Number of layers.')
+flags.DEFINE_integer('hidden_width', 256, 'Number of hidden_width.')
+
+flags.DEFINE_string('init_with_args', None, 'Extra args, ')
+flags.DEFINE_string('setting_file_path', None, 'Extra args, Setting file path.')
+
+flags.DEFINE_integer('num_actions', None, 'Number of actions.')
+flags.DEFINE_integer('action_size', None, 'Alias value for Number of actions.')
+
+
 FLAGS = flags.FLAGS
 T = 0
 TMAX = FLAGS.tmax
+
+FLAGS.env = FLAGS.env or FLAGS.game
+FLAGS.num_actions = FLAGS.num_actions or FLAGS.action_size
 
 def sample_final_epsilon():
     """
@@ -75,8 +108,14 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
 
     summary_placeholders, update_ops, summary_op = summary_ops
 
+    env_type, env_id = get_env_type(FLAGS)
     # Wrap env with AtariEnvironment helper class
-    env = AtariEnvironment(gym_env=env, resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, agent_history_length=FLAGS.agent_history_length)
+    print('env_id: {}, env_type: {}'.format(env_id, env_type))
+
+    if env_type in {'atari'}:
+        env = AtariEnvironment(gym_env=env, resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, agent_history_length=FLAGS.agent_history_length)
+    else:
+        env = CustomEnvironment(gym_env=env, input_size=FLAGS.input_size, agent_history_length=FLAGS.agent_history_length, extra_args={'init_with_args':FLAGS.init_with_args, 'setting_file_path':FLAGS.setting_file_path})
 
     # Initialize network gradients
     s_batch = []
@@ -170,14 +209,27 @@ def actor_learner_thread(thread_id, env, session, graph_ops, num_actions, summar
 
 def build_graph(num_actions):
     # Create shared deep q network
-    s, q_network = build_network(num_actions=num_actions, agent_history_length=FLAGS.agent_history_length,
-                      resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, name_scope="q-network")
+
+    if env_type in {'atari'}:
+        s, q_network = build_network(num_actions=num_actions, agent_history_length=FLAGS.agent_history_length,
+                                     model_type='2d_cnn', resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, name_scope="q-network")
+    else:
+        s, q_network = build_network(num_actions=num_actions, agent_history_length=FLAGS.agent_history_length,
+                                     model_type='dnn', input_size=FLAGS.input_size, name_scope="q-network", layers=FLAGS.layers, hidden_width=FLAGS.hidden_width)
+
     network_params = q_network.trainable_weights
     q_values = q_network(s)
 
     # Create shared target network
-    st, target_q_network = build_network(num_actions=num_actions, agent_history_length=FLAGS.agent_history_length,
-                      resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, name_scope="target-network")
+    if env_type in {'atari'}:
+        st, target_q_network = build_network(num_actions=num_actions, agent_history_length=FLAGS.agent_history_length,
+                                             model_type='2d_cnn', resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, name_scope="target-network")
+    else:
+        st, target_q_network = build_network(num_actions=num_actions, agent_history_length=FLAGS.agent_history_length,
+                                             model_type='dnn', input_size=FLAGS.input_size,
+                                             name_scope="target-network",
+                                             layers=FLAGS.layers, hidden_width=FLAGS.hidden_width)
+
     target_network_params = target_q_network.trainable_weights
     target_q_values = target_q_network(st)
 
@@ -282,9 +334,15 @@ def evaluation(session, graph_ops, saver):
     q_values = graph_ops["q_values"]
 
     # Wrap env with AtariEnvironment helper class
-    env = AtariEnvironment(gym_env=monitor_env, resized_width=FLAGS.resized_width, resized_height=FLAGS.resized_height, agent_history_length=FLAGS.agent_history_length)
+    if env_type in {'atari'}:
+        env = AtariEnvironment(gym_env=monitor_env, resized_width=FLAGS.resized_width,
+                               resized_height=FLAGS.resized_height, agent_history_length=FLAGS.agent_history_length)
+    else:
+        env = CustomEnvironment(gym_env=monitor_env, input_size=FLAGS.input_size,
+                                agent_history_length=FLAGS.agent_history_length,
+                                extra_args = {'init_with_args': FLAGS.init_with_args, 'setting_file_path': FLAGS.setting_file_path})
 
-    for i_episode in xrange(FLAGS.num_eval_episodes):
+    for i_episode in range(FLAGS.num_eval_episodes):
         s_t = env.get_initial_state()
         ep_reward = 0
         terminal = False
@@ -304,7 +362,7 @@ def main(_):
   session = tf.Session(graph=g)
   with g.as_default(), session.as_default():
     K.set_session(session)
-    num_actions = get_num_actions()
+    num_actions = FLAGS.num_actions or get_num_actions()
     graph_ops = build_graph(num_actions)
     saver = tf.train.Saver()
 
@@ -312,6 +370,39 @@ def main(_):
         evaluation(session, graph_ops, saver)
     else:
         train(session, graph_ops, num_actions, saver)
+
+# define env_type
+_game_envs = defaultdict(set)
+for env in gym.envs.registry.all():
+    # TODO: solve this with regexes
+    env_type = env._entry_point.split(':')[0].split('.')[-1]
+    _game_envs[env_type].add(env.id)
+
+def get_env_type(args):
+    env_id = args.env
+
+    if args.env_type is not None:
+        return args.env_type, env_id
+
+    # Re-parse the gym registry, since we could have new envs since last time.
+    for env in gym.envs.registry.all():
+        env_type = env._entry_point.split(':')[0].split('.')[-1]
+        _game_envs[env_type].add(env.id)  # This is a set so add is idempotent
+
+    if env_id in _game_envs.keys():
+        env_type = env_id
+        env_id = [g for g in _game_envs[env_type]][0]
+    else:
+        env_type = None
+        for g, e in _game_envs.items():
+            if env_id in e:
+                env_type = g
+                break
+        if ':' in env_id:
+            env_type = re.sub(r':.*', '', env_id)
+        assert env_type is not None, 'env_id {} is not recognized in env types'.format(env_id, _game_envs.keys())
+
+    return env_type, env_id
 
 if __name__ == "__main__":
   tf.app.run()
